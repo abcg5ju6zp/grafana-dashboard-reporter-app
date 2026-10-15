@@ -13,15 +13,17 @@ import (
 	"github.com/mahendrapaipuri/grafana-dashboard-reporter-app/pkg/plugin/helpers"
 )
 
-// HasAccess verifies if the current request context has access to certain action.
-func (app *App) HasAccess(req *http.Request, action string, resources ...authz.Resource) (bool, error) {
+// hasAccess verifies if the current request context has access to certain action.
+// It uses the authorization client and HTTP client of the generation the report
+// holds a lease on, so permission checks never cross generation boundaries.
+func (g *Generation) hasAccess(req *http.Request, grafanaSemVer string, action string, resources ...authz.Resource) (bool, error) {
 	// Retrieve the id token
 	idToken := req.Header.Get(GrafanaUserSignInTokenHeaderName)
 	if idToken == "" {
 		return false, errors.New("id token not found")
 	}
 
-	authzClient, err := app.GetAuthZClient(req)
+	authzClient, err := g.getAuthZClient(req, grafanaSemVer)
 	if err != nil {
 		return false, err
 	}
@@ -35,18 +37,20 @@ func (app *App) HasAccess(req *http.Request, action string, resources ...authz.R
 	return true, nil
 }
 
-// GetAuthZClient returns an authz enforcement client configured thanks to the plugin context.
-func (app *App) GetAuthZClient(req *http.Request) (authz.EnforcementClient, error) {
+// getAuthZClient returns an authz enforcement client configured thanks to the plugin context.
+// The client is cached per generation and recreated only when the service account
+// token used by a request changes.
+func (g *Generation) getAuthZClient(req *http.Request, grafanaSemVer string) (authz.EnforcementClient, error) {
 	ctx := req.Context()
 	ctxLogger := log.DefaultLogger.FromContext(ctx)
 
 	// Prevent two concurrent calls from updating the client
-	app.mx.Lock()
-	defer app.mx.Unlock()
+	g.authzMx.Lock()
+	defer g.authzMx.Unlock()
 
 	grafanaConfig := config.GrafanaConfigFromContext(req.Context())
 
-	grafanaAppURL, err := app.grafanaAppURL(grafanaConfig)
+	grafanaAppURL, err := grafanaAppURL(&g.conf, grafanaConfig)
 	if err != nil {
 		ctxLogger.Error("failed to get app URL", "err", err)
 
@@ -57,27 +61,27 @@ func (app *App) GetAuthZClient(req *http.Request) (authz.EnforcementClient, erro
 	// has been manually configured. In this case we cannot check permissions and moreover
 	// we cannot make API requests to Grafana
 	saToken, err := grafanaConfig.PluginAppClientSecret()
-	if err != nil && app.conf.Token == "" {
+	if err != nil && g.conf.Token == "" {
 		ctxLogger.Error("failed to fetch service account and configured token", "error", err)
 
 		return nil, err
 	} else {
 		if saToken == "" {
-			saToken = app.conf.Token
+			saToken = g.conf.Token
 		}
 	}
 
-	if saToken == app.saToken {
+	if saToken == g.saToken {
 		ctxLogger.Debug("token unchanged returning existing authz client")
 
-		return app.authzClient, nil
+		return g.authzClient, nil
 	}
 
 	// Header "typ" has been added only in Grafana 11.1.0 (https://github.com/grafana/grafana/pull/87430)
 	// So this check will fail for Grafana < 11.1.0
 	// Set VerifierConfig{DisableTypHeaderCheck: true} for those cases
 	var disableTypHeaderCheck bool
-	if helpers.SemverCompare(app.grafanaSemVer, "v11.1.0") == -1 {
+	if helpers.SemverCompare(grafanaSemVer, "v11.1.0") == -1 {
 		disableTypHeaderCheck = true
 	}
 
@@ -88,8 +92,8 @@ func (app *App) GetAuthZClient(req *http.Request) (authz.EnforcementClient, erro
 		// Grafana is signing the JWTs on local setups
 		JWKsURL: grafanaAppURL + "/api/signing-keys/keys",
 	},
-		// Use the configured HTTP client
-		authz.WithHTTPClient(app.httpClient),
+		// Use the configured HTTP client of the current generation
+		authz.WithHTTPClient(g.httpClient),
 		// Configure verifier
 		authz.WithVerifier(authn.NewVerifier[authz.CustomClaims](authn.VerifierConfig{
 			DisableTypHeaderCheck: disableTypHeaderCheck,
@@ -98,7 +102,7 @@ func (app *App) GetAuthZClient(req *http.Request) (authz.EnforcementClient, erro
 			authn.NewKeyRetriever(authn.KeyRetrieverConfig{
 				SigningKeysURL: grafanaAppURL + "/api/signing-keys/keys",
 			},
-				authn.WithHTTPClientKeyRetrieverOpt(app.httpClient)),
+				authn.WithHTTPClientKeyRetrieverOpt(g.httpClient)),
 		)),
 		// Fetch all the user permission prefixed with dashboards
 		authz.WithSearchByPrefix("dashboards"),
@@ -116,8 +120,8 @@ func (app *App) GetAuthZClient(req *http.Request) (authz.EnforcementClient, erro
 		return nil, err
 	}
 
-	app.authzClient = client
-	app.saToken = saToken
+	g.authzClient = client
+	g.saToken = saToken
 
 	return client, nil
 }

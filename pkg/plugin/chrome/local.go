@@ -143,21 +143,16 @@ func NewLocalBrowserInstance(ctx context.Context, logger log.Logger, insecureSki
 	chromeOptions = append(chromeOptions, chromedp.Flag("auto-open-devtools-for-tabs", true))
 	// chromeOptions = append(chromeOptions, chromedp.Flag("log-net-log", "network.json"))
 
-	// Create a new browser allocator
-	/*
-		The side-effect here is everytime the settings are updated from Grafana UI
-		the current App instance will be disposed and a new app instance is created.
-		The disposed app instance will call `Dispose()` receiver after few seconds
-		which will eventually clean up browser instance.
-
-		When there is a API request in progress, most likely that request will end up
-		with context deadline error as browser instance will be cleaned up. But there
-		will be a new browser straight away and subsequent request will pass.
-
-		As it is only users with `Admin` role can update the Settings from Grafana UI
-		it is not normal that these will be updated regularly. So, we can live with
-		this side-effect without running into deep issues.
-	*/
+	// Create a new browser allocator.
+	//
+	// Browser instances are owned by configuration generations (see the
+	// generation Manager in pkg/plugin). When settings are updated, a complete
+	// new generation (config, HTTP client, browser and worker pools) is built
+	// and validated before it starts serving reports. The previous generation
+	// stops receiving new requests and its browser is closed only after all
+	// reports holding leases on it have finished (or after the bounded wait at
+	// process shutdown), so settings updates no longer interrupt in-flight
+	// reports.
 	allocCtx, _ := chromedp.NewExecAllocator(ctx, chromeOptions...)
 
 	// start a browser (and an empty tab) so we can add more tabs to the browser
@@ -182,6 +177,11 @@ func NewLocalBrowserInstance(ctx context.Context, logger log.Logger, insecureSki
 // Name returns the kind of browser instance.
 func (i *LocalInstance) Name() string {
 	return "local"
+}
+
+// Ready verifies the browser process can open a tab and execute actions.
+func (i *LocalInstance) Ready(ctx context.Context, logger log.Logger) error {
+	return verifyReady(ctx, logger, i)
 }
 
 // NewTab starts and returns a new tab on current browser instance.

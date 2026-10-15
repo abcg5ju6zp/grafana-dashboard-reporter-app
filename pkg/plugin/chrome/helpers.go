@@ -6,13 +6,46 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
+	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 )
+
+// browserReadyTimeout is the maximum time to wait for a browser instance to
+// prove that it can open a tab and execute an action during generation build.
+const browserReadyTimeout = 15 * time.Second
+
+// verifyReady opens a new tab on the instance, loads about:blank and closes the
+// tab. For a remote browser this forces the WebSocket connection to the remote
+// Chromium and therefore fails fast when it is unreachable. A configuration
+// generation is promoted only after this check succeeds.
+func verifyReady(_ context.Context, logger log.Logger, instance Instance) error {
+	tab := instance.NewTab(logger, nil)
+
+	// RunWithTimeout derives a bounded context from the tab context, so an
+	// unreachable remote Chromium cannot stall the generation build forever.
+	err := tab.RunWithTimeout(browserReadyTimeout, chromedp.Navigate("about:blank"))
+
+	// Tear the probe tab down directly. Tab.Close runs a browser-level
+	// ClearBrowserCookies round trip, which can block indefinitely on a bare
+	// tab that has not enabled the page session; the readiness probe neither
+	// navigated to authenticated content nor needs cookie cleanup.
+	cancelErr := chromedp.Cancel(tab.ctx)
+	if cancelErr != nil {
+		logger.Debug("error canceling readiness probe tab", "error", cancelErr)
+	}
+
+	if err != nil {
+		return fmt.Errorf("browser is not ready: %w", err)
+	}
+
+	return nil
+}
 
 /*
 	This file contains chromedp package related helper functions.

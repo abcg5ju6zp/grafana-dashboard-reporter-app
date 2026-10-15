@@ -36,9 +36,9 @@ const (
 )
 
 // convertPanelIDs returns panel IDs based on Grafana version.
-func (app *App) convertPanelIDs(ids []string) []string {
+func convertPanelIDs(grafanaSemVer string, ids []string) []string {
 	// For Grafana < 11.3.0, we can use the IDs as such
-	if helpers.SemverCompare(app.grafanaSemVer, "v11.3.0") == -1 {
+	if helpers.SemverCompare(grafanaSemVer, "v11.3.0") == -1 {
 		return ids
 	}
 
@@ -56,7 +56,7 @@ func (app *App) convertPanelIDs(ids []string) []string {
 }
 
 // updateConfig updates the default config from query parameters.
-func (app *App) updateConfig(req *http.Request, conf *plugin_config.Config) {
+func updateConfig(req *http.Request, grafanaSemVer string, conf *plugin_config.Config) {
 	if req.URL.Query().Has("theme") {
 		conf.Theme = req.URL.Query().Get("theme")
 	}
@@ -100,15 +100,15 @@ func (app *App) updateConfig(req *http.Request, conf *plugin_config.Config) {
 	}
 
 	if req.URL.Query().Has("includePanelID") {
-		conf.IncludePanelIDs = app.convertPanelIDs(req.URL.Query()["includePanelID"])
+		conf.IncludePanelIDs = convertPanelIDs(grafanaSemVer, req.URL.Query()["includePanelID"])
 	}
 
 	if req.URL.Query().Has("excludePanelID") {
-		conf.ExcludePanelIDs = app.convertPanelIDs(req.URL.Query()["excludePanelID"])
+		conf.ExcludePanelIDs = convertPanelIDs(grafanaSemVer, req.URL.Query()["excludePanelID"])
 	}
 
 	if req.URL.Query().Has("includePanelDataID") {
-		conf.IncludePanelDataIDs = app.convertPanelIDs(req.URL.Query()["includePanelDataID"])
+		conf.IncludePanelDataIDs = convertPanelIDs(grafanaSemVer, req.URL.Query()["includePanelDataID"])
 	}
 }
 
@@ -147,25 +147,26 @@ func (app *App) featureTogglesEnabled(ctx context.Context) bool {
 
 // grafanaAppURL returns the Grafana's App URL. User configured URL has higher
 // precedence than the App URL in the request's context.
-func (app *App) grafanaAppURL(grafanaConfig *config.GrafanaCfg) (string, error) {
-	var grafanaAppURL string
+func grafanaAppURL(conf *plugin_config.Config, grafanaConfig *config.GrafanaCfg) (string, error) {
+	var appURL string
 
 	var err error
 
-	if app.conf.AppURL != "" {
-		grafanaAppURL = app.conf.AppURL
+	if conf.AppURL != "" {
+		appURL = conf.AppURL
 	} else {
-		grafanaAppURL, err = grafanaConfig.AppURL()
+		appURL, err = grafanaConfig.AppURL()
 		if err != nil {
 			return "", err
 		}
 	}
 
-	return strings.TrimSuffix(grafanaAppURL, "/"), nil
+	return strings.TrimSuffix(appURL, "/"), nil
 }
 
-// dashboardFolder fetches current dashboard folder from Grafana API.
-func (app *App) dashboardFolder(ctx context.Context, appURL, folderUID string, authHeader http.Header) ([]string, error) {
+// dashboardFolder fetches current dashboard folder from Grafana API using the
+// HTTP client of the generation.
+func (g *Generation) dashboardFolder(ctx context.Context, appURL, folderUID string, authHeader http.Header) ([]string, error) {
 	dashURL := fmt.Sprintf("%s/api/folders/%s", appURL, folderUID)
 
 	// Create a new GET request
@@ -182,7 +183,7 @@ func (app *App) dashboardFolder(ctx context.Context, appURL, folderUID string, a
 	}
 
 	// Make request
-	resp, err := app.httpClient.Do(req)
+	resp, err := g.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("error executing request for %s: %w", dashURL, err)
 	}
@@ -219,8 +220,9 @@ func (app *App) dashboardFolder(ctx context.Context, appURL, folderUID string, a
 	return parentUIDs, nil
 }
 
-// dashboardModel fetches dashboard JSON model from Grafana API.
-func (app *App) dashboardModel(ctx context.Context, appURL, dashUID string, authHeader http.Header, values url.Values) (*dashboard.Model, error) {
+// dashboardModel fetches dashboard JSON model from Grafana API using the HTTP
+// client of the generation.
+func (g *Generation) dashboardModel(ctx context.Context, appURL, dashUID string, authHeader http.Header, values url.Values) (*dashboard.Model, error) {
 	dashURL := fmt.Sprintf("%s/api/dashboards/uid/%s", appURL, dashUID)
 
 	// Create a new GET request
@@ -237,7 +239,7 @@ func (app *App) dashboardModel(ctx context.Context, appURL, dashUID string, auth
 	}
 
 	// Make request
-	resp, err := app.httpClient.Do(req) //nolint:gosec
+	resp, err := g.httpClient.Do(req) //nolint:gosec
 	if err != nil {
 		return nil, fmt.Errorf("error executing request for %s: %w", dashURL, err)
 	}
@@ -272,7 +274,7 @@ func (app *App) dashboardModel(ctx context.Context, appURL, dashUID string, auth
 	// parent folder, they are inherited in the nested dashboards and so, we need to
 	// provide the top level one where permissions are set
 	if model.Meta.FolderUID != "" {
-		folderUIDs, err := app.dashboardFolder(ctx, appURL, model.Meta.FolderUID, authHeader)
+		folderUIDs, err := g.dashboardFolder(ctx, appURL, model.Meta.FolderUID, authHeader)
 		if err != nil {
 			return nil, fmt.Errorf("error fetching dashboard folder: %w", err)
 		}
@@ -292,10 +294,23 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var err error
+	// Acquire a single generation lease at the entry. From the dashboard model
+	// fetch through permission checks, panel PNG/CSV generation, HTML/PDF
+	// rendering and the end of the response, this report uses exactly this
+	// generation's config, HTTP client, worker pools and browser. The generation
+	// is kept alive until the lease is released even if settings are updated
+	// meanwhile.
+	lease, err := app.manager.Lease()
+	if err != nil {
+		log.DefaultLogger.FromContext(req.Context()).Error("cannot start report: no active generation", "err", err)
+		http.Error(w, "report service is temporarily unavailable", http.StatusServiceUnavailable)
 
-	// Always start with an instance of current app's config
-	conf := app.conf
+		return
+	}
+
+	defer lease.Release()
+
+	gen := lease.Generation()
 
 	// Get context logger which we will use everywhere
 	ctxLogger := log.DefaultLogger.FromContext(req.Context())
@@ -314,12 +329,15 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Add dash uid and user to logger
-	ctxLogger = ctxLogger.With("user", currentUser, "dash_uid", dashboardUID)
+	ctxLogger = ctxLogger.With("user", currentUser, "dash_uid", dashboardUID, "generation", gen.id)
+
+	// Always start with a copy of the leased generation's config
+	conf := gen.conf
 
 	grafanaConfig := config.GrafanaConfigFromContext(req.Context())
 
 	// Get Grafana App URL by looking both at passed config and user defined config
-	grafanaAppURL, err := app.grafanaAppURL(grafanaConfig)
+	grafanaAppURL, err := grafanaAppURL(&conf, grafanaConfig)
 	if err != nil {
 		ctxLogger.Error("failed to get app URL", "err", err)
 		http.Error(w, "error generating report", http.StatusInternalServerError)
@@ -328,7 +346,7 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Update plugin's config from query params
-	app.updateConfig(req, &conf)
+	updateConfig(req, app.grafanaSemVer, &conf)
 
 	// Validate new updated config
 	err = conf.RTValidate()
@@ -380,7 +398,7 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Get dashboard JSON model from API
-	model, err := app.dashboardModel(req.Context(), grafanaAppURL, dashboardUID, authHeader, req.URL.Query())
+	model, err := gen.dashboardModel(req.Context(), grafanaAppURL, dashboardUID, authHeader, req.URL.Query())
 	if err != nil {
 		ctxLogger.Error("failed to get dashboard JSON model", "err", err)
 		http.Error(w, "error generating report", http.StatusInternalServerError)
@@ -419,8 +437,8 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 	// Here we check if user has permissions to do an action "dashboards:read" on
 	// dashboards resource of a given dashboard UID
 	if app.featureTogglesEnabled(req.Context()) {
-		hasAccess, err := app.HasAccess(
-			req, "dashboards:read",
+		hasAccess, err := gen.hasAccess(
+			req, app.grafanaSemVer, "dashboards:read",
 			resources...,
 		)
 		if err != nil || !hasAccess {
@@ -439,8 +457,8 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 	grafanaDashboard, err := dashboard.New(
 		ctxLogger,
 		&conf,
-		app.httpClient,
-		app.chromeInstance,
+		gen.httpClient,
+		gen.chromeInstance,
 		grafanaAppURL,
 		app.grafanaSemVer,
 		model,
@@ -453,15 +471,15 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	ctxLogger.Info(fmt.Sprintf("generate report using %s chrome", app.chromeInstance.Name()))
+	ctxLogger.Info(fmt.Sprintf("generate report using %s chrome", gen.chromeInstance.Name()))
 
 	// Make app new Report to put all PNGs into app HTML template and print it into app PDF
 	pdfReport := report.New(
 		ctxLogger,
 		&conf,
-		app.httpClient,
-		app.chromeInstance,
-		app.workerPools,
+		gen.httpClient,
+		gen.chromeInstance,
+		gen.workerPools,
 		grafanaDashboard,
 	)
 

@@ -26,6 +26,13 @@ func (i *RemoteInstance) Name() string {
 	return "remote"
 }
 
+// Ready forces the connection to the remote Chromium by opening a tab and
+// loading about:blank. The remote allocator connects lazily, so without this
+// check an unreachable Chromium would only fail when the first report runs.
+func (i *RemoteInstance) Ready(ctx context.Context, logger log.Logger) error {
+	return verifyReady(ctx, logger, i)
+}
+
 // NewTab starts and returns a new tab on current browser instance.
 func (i *RemoteInstance) NewTab(logger log.Logger, _ *config.Config) *Tab {
 	chromeLogger := logger.With("subsystem", "chromium")
