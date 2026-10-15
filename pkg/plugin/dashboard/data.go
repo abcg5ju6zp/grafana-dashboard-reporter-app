@@ -17,14 +17,14 @@ import (
 )
 
 // PanelCSV returns CSV data of a given panel.
-func (d *Dashboard) PanelCSV(_ context.Context, p Panel) (CSVData, error) {
+func (d *Dashboard) PanelCSV(ctx context.Context, p Panel) (CSVData, error) {
 	// Get panel CSV data URL
 	panelURL := d.panelCSVURL(p)
 
 	defer helpers.TimeTrack(time.Now(), "fetch panel CSV data", d.logger, "fetcher", "native", "panel_id", p.ID, "url", panelURL)
 
-	// Create a new tab
-	tab := d.chromeInstance.NewTab(d.logger, d.conf)
+	// Create a new tab bound to the request snapshot context
+	tab := d.chromeInstance.NewTab(ctx, d.logger, d.conf)
 	// Set a timeout for the tab
 	// Fail-safe for newer Grafana versions, if css has been changed.
 	tab.WithTimeout(2 * d.conf.HTTPClientOptions.Timeouts.Timeout)

@@ -184,12 +184,23 @@ func (i *LocalInstance) Name() string {
 	return "local"
 }
 
-// NewTab starts and returns a new tab on current browser instance.
-func (i *LocalInstance) NewTab(_ log.Logger, _ *config.Config) *Tab {
-	ctx, _ := chromedp.NewContext(i.browserCtx)
+// NewTab starts and returns a new tab on current browser instance. The tab is
+// bound to ctx: canceling ctx (request snapshot canceled or instance
+// generation disposed) cancels every in-flight browser action of the tab.
+func (i *LocalInstance) NewTab(ctx context.Context, _ log.Logger, _ *config.Config) *Tab {
+	browserTabCtx, _ := chromedp.NewContext(i.browserCtx)
+
+	tabCtx, cancelTab := context.WithCancel(browserTabCtx)
+
+	// Propagate snapshot/request cancellation to the browser tab.
+	stopParentWatch := context.AfterFunc(ctx, cancelTab)
 
 	return &Tab{
-		ctx: ctx,
+		ctx: tabCtx,
+		cancel: func() {
+			stopParentWatch()
+			cancelTab()
+		},
 	}
 }
 

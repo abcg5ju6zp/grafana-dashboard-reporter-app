@@ -88,7 +88,7 @@ func (r *Report) Generate(ctx context.Context, writer http.ResponseWriter) error
 		header := fmt.Sprintf(`inline; filename*=UTF-8''%s.pdf`, filename)
 		writer.Header().Add("Content-Disposition", header)
 
-		err = r.renderPDF(htmlReport, writer)
+		err = r.renderPDF(ctx, htmlReport, writer)
 		if err != nil {
 			return fmt.Errorf("failed to render PDF: %w", err)
 		}
@@ -115,31 +115,48 @@ func (r *Report) populatePanels(ctx context.Context, dashboardData *dashboard.Da
 		if slices.Contains(pngPanels, idx) {
 			wg.Add(1)
 
-			r.pools[worker.Renderer].Do(func() {
+			// Enqueue with the snapshot context: if the instance generation
+			// is disposed or the request is canceled, fail instead of
+			// blocking on a worker that will never pick the task up.
+			pngErr := r.pools[worker.Renderer].Do(ctx, func() {
 				defer wg.Done()
 
 				panelPNG, err := r.dashboard.PanelPNG(ctx, panel)
 				if err != nil {
 					errorCh <- fmt.Errorf("failed to fetch PNG data for panel %s: %w", panel.ID, err)
+
+					return
 				}
 
 				dashboardData.Panels[idx].EncodedImage = panelPNG
 			})
+			if pngErr != nil {
+				wg.Done()
+
+				errorCh <- fmt.Errorf("failed to schedule PNG fetch for panel %s: %w", panel.ID, pngErr)
+			}
 		}
 
 		if slices.Contains(tablePanels, idx) {
 			wg.Add(1)
 
-			r.pools[worker.Browser].Do(func() {
+			csvErr := r.pools[worker.Browser].Do(ctx, func() {
 				defer wg.Done()
 
 				panelData, err := r.dashboard.PanelCSV(ctx, panel)
 				if err != nil && !errors.Is(err, dashboard.ErrEmptyPanelElement) {
 					errorCh <- fmt.Errorf("failed to fetch CSV data for panel %s: %w", panel.ID, err)
+
+					return
 				}
 
 				dashboardData.Panels[idx].CSVData = panelData
 			})
+			if csvErr != nil {
+				wg.Done()
+
+				errorCh <- fmt.Errorf("failed to schedule CSV fetch for panel %s: %w", panel.ID, csvErr)
+			}
 		}
 	}
 
@@ -272,11 +289,11 @@ func (r *Report) generateHTMLFile(dashboardData *dashboard.Data) (HTML, error) {
 }
 
 // renderPDF renders HTML page into PDF using Chromium.
-func (r *Report) renderPDF(htmlReport HTML, writer io.Writer) error {
+func (r *Report) renderPDF(ctx context.Context, htmlReport HTML, writer io.Writer) error {
 	defer helpers.TimeTrack(time.Now(), "pdf rendering", r.logger)
 
-	// Create a new tab
-	tab := r.chromeInstance.NewTab(r.logger, r.conf)
+	// Create a new tab bound to the request snapshot context
+	tab := r.chromeInstance.NewTab(ctx, r.logger, r.conf)
 	defer tab.Close(r.logger)
 
 	err := tab.PrintToPDF(chrome.PDFOptions{

@@ -67,7 +67,7 @@ func TestNavigateAndWaitForScopesHeadersToOrigin(t *testing.T) {
 
 	defer instance.Close(log.NewNullLogger())
 
-	tab := instance.NewTab(log.NewNullLogger(), nil)
+	tab := instance.NewTab(t.Context(), log.NewNullLogger(), nil)
 	tab.WithTimeout(30 * time.Second)
 
 	defer tab.Close(log.NewNullLogger())

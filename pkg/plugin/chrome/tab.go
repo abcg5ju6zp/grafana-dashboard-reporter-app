@@ -120,7 +120,19 @@ func (t *Tab) NavigateAndWaitFor(addr string, headers map[string]any, eventName 
 
 // WithTimeout set the timeout for the actions in the current tab.
 func (t *Tab) WithTimeout(timeout time.Duration) {
-	t.ctx, t.cancel = context.WithTimeout(t.ctx, timeout)
+	ctx, cancelTimeout := context.WithTimeout(t.ctx, timeout)
+
+	// Preserve the parent cancellation chain installed by NewTab.
+	prevCancel := t.cancel
+
+	t.ctx = ctx
+	t.cancel = func() {
+		cancelTimeout()
+
+		if prevCancel != nil {
+			prevCancel()
+		}
+	}
 }
 
 // Run executes the actions in the current tab.

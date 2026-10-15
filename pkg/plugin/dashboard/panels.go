@@ -73,14 +73,14 @@ func (d *Dashboard) panels(ctx context.Context) ([]Panel, error) {
 }
 
 // panelMetaData fetches dashboard panels metadata from Grafana chromium browser instance.
-func (d *Dashboard) panelMetaData(_ context.Context) ([]any, error) {
+func (d *Dashboard) panelMetaData(ctx context.Context) ([]any, error) {
 	// Get dashboard URL
 	dashURL := fmt.Sprintf("%s/d/%s/_?%s", d.appURL, d.model.Dashboard.UID, d.model.Dashboard.Variables.Encode())
 
 	defer helpers.TimeTrack(time.Now(), "fetch dashboard panels metadata", d.logger, "url", dashURL)
 
-	// Create a new tab
-	tab := d.chromeInstance.NewTab(d.logger, d.conf)
+	// Create a new tab bound to the request snapshot context
+	tab := d.chromeInstance.NewTab(ctx, d.logger, d.conf)
 
 	tab.WithTimeout(2 * d.conf.HTTPClientOptions.Timeouts.Timeout)
 	defer tab.Close(d.logger)

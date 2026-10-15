@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "报告入口冻结实例代际、请求用户、Grafana 地址、认证头和全部报告选项，后续不再读取可变共享配置。"
+  - id: 2
+    type: f2p
+    text: "cookie、显式 token 和 service account 按既有优先级选择一次，当前报告不会在失败后切换身份。"
+  - id: 3
+    type: f2p
+    text: "认证密钥获取失败时不读取仪表盘、不启动面板 worker 或 Chrome 资源。"
+  - id: 4
+    type: f2p
+    text: "仪表盘模型、父文件夹和权限判断使用同一身份与资源快照，拒绝时不会继续下游。"
+  - id: 5
+    type: f2p
+    text: "配置更新或 token 轮换发生在权限检查之后，当前报告仍用原快照完成或一致失败。"
+  - id: 6
+    type: f2p
+    text: "面板 PNG、CSV 与 PDF 渲染都继承同一认证头和查询配置，不形成跨身份内容。"
+  - id: 7
+    type: f2p
+    text: "实例 Dispose 或重载与请求交错时，旧快照有界完成或取消，新请求只进入新实例。"
+  - id: 8
+    type: p2p
+    text: "三种认证模式、公开仪表盘和正常配置报告保持兼容。"

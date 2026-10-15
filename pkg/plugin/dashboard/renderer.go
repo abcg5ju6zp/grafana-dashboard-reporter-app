@@ -28,14 +28,14 @@ func (d *Dashboard) PanelPNG(ctx context.Context, p Panel) (PanelImage, error) {
 }
 
 // panelPNGNativeRenderer returns panel PNG data by capturing screenshot of panel in browser.
-func (d *Dashboard) panelPNGNativeRenderer(_ context.Context, p Panel) (PanelImage, error) {
+func (d *Dashboard) panelPNGNativeRenderer(ctx context.Context, p Panel) (PanelImage, error) {
 	// Get panel URL
 	panelURL := d.panelPNGURL(p, false)
 
 	defer helpers.TimeTrack(time.Now(), "fetch panel PNG", d.logger, "panel_id", p.ID, "renderer", "native", "url", panelURL)
 
-	// Create a new tab
-	tab := d.chromeInstance.NewTab(d.logger, d.conf)
+	// Create a new tab bound to the request snapshot context
+	tab := d.chromeInstance.NewTab(ctx, d.logger, d.conf)
 
 	tab.WithTimeout(2 * d.conf.HTTPClientOptions.Timeouts.Timeout)
 	defer tab.Close(d.logger)
@@ -116,21 +116,43 @@ func (d *Dashboard) panelPNGImageRenderer(ctx context.Context, p Panel) (PanelIm
 	if err != nil {
 		return PanelImage{}, fmt.Errorf("error executing request for %s: %w", panelURL, err)
 	}
-	defer resp.Body.Close()
 
-	// Do multiple tries to get panel before giving up
+	// Do multiple tries to get panel before giving up. Retries always reuse
+	// the same request and therefore the frozen authentication header: an
+	// expired or rejected credential must return a consistent failure, never
+	// trigger a switch to another token.
 	for retries := 1; retries < 3 && resp.StatusCode != http.StatusOK; retries++ {
+		// Do not retry authentication/authorization failures
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			return PanelImage{}, fmt.Errorf(
+				"%w: URL: %s. Status: %s, message: %s",
+				ErrDashboardHTTPError,
+				panelURL,
+				resp.Status,
+				string(body),
+			)
+		}
+
 		resp.Body.Close()
 
 		delay := getPanelRetrySleepTime * time.Duration(retries)
-		time.Sleep(delay)
+
+		// Wait interruptibly so disposal/cancel fails fast
+		select {
+		case <-ctx.Done():
+			return PanelImage{}, fmt.Errorf("canceled while waiting to retry panel PNG %s: %w", panelURL, ctx.Err())
+		case <-time.After(delay):
+		}
 
 		resp, err = d.httpClient.Do(req)
 		if err != nil {
 			return PanelImage{}, fmt.Errorf("error executing retry request for %s: %w", panelURL, err)
 		}
-		defer resp.Body.Close()
 	}
+	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,8 +11,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/grafana/grafana-plugin-sdk-go/backend"
-	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/config"
 	"github.com/mahendrapaipuri/authlib/authz"
 	plugin_config "github.com/mahendrapaipuri/grafana-dashboard-reporter-app/pkg/plugin/config"
@@ -55,37 +54,38 @@ func (app *App) convertPanelIDs(ids []string) []string {
 	return panelIDs
 }
 
-// updateConfig updates the default config from query parameters.
-func (app *App) updateConfig(req *http.Request, conf *plugin_config.Config) {
-	if req.URL.Query().Has("theme") {
-		conf.Theme = req.URL.Query().Get("theme")
+// updateConfigFromValues updates the frozen per-request config from query
+// parameters. The instance config is never mutated.
+func (app *App) updateConfigFromValues(values url.Values, conf *plugin_config.Config) {
+	if values.Has("theme") {
+		conf.Theme = values.Get("theme")
 	}
 
-	if req.URL.Query().Has("layout") {
-		conf.Layout = req.URL.Query().Get("layout")
+	if values.Has("layout") {
+		conf.Layout = values.Get("layout")
 	}
 
-	if req.URL.Query().Has("orientation") {
-		conf.Orientation = req.URL.Query().Get("orientation")
+	if values.Has("orientation") {
+		conf.Orientation = values.Get("orientation")
 	}
 
-	if req.URL.Query().Has("dashboardMode") {
-		conf.DashboardMode = req.URL.Query().Get("dashboardMode")
+	if values.Has("dashboardMode") {
+		conf.DashboardMode = values.Get("dashboardMode")
 	}
 
-	if req.URL.Query().Has("format") {
-		conf.ReportFormat = req.URL.Query().Get("format")
+	if values.Has("format") {
+		conf.ReportFormat = values.Get("format")
 	}
 
-	if req.URL.Query().Has("timeZone") {
-		conf.TimeZone = req.URL.Query().Get("timeZone")
+	if values.Has("timeZone") {
+		conf.TimeZone = values.Get("timeZone")
 	}
 
 	// Starting from Grafana v11.3.0, Grafana sets timezone query parameter.
 	// We should give priority to that over the plugin's config value.
 	// We will still support plugin's config parameter for backwards compatibility
-	if req.URL.Query().Has("timezone") {
-		timeZone := req.URL.Query().Get("timezone")
+	if values.Has("timezone") {
+		timeZone := values.Get("timezone")
 		if !slices.Contains([]string{"browser", "default"}, timeZone) {
 			if timeZone == "utc" {
 				timeZone = "Etc/UTC"
@@ -95,20 +95,20 @@ func (app *App) updateConfig(req *http.Request, conf *plugin_config.Config) {
 		}
 	}
 
-	if req.URL.Query().Has("timeFormat") {
-		conf.TimeFormat = req.URL.Query().Get("timeFormat")
+	if values.Has("timeFormat") {
+		conf.TimeFormat = values.Get("timeFormat")
 	}
 
-	if req.URL.Query().Has("includePanelID") {
-		conf.IncludePanelIDs = app.convertPanelIDs(req.URL.Query()["includePanelID"])
+	if values.Has("includePanelID") {
+		conf.IncludePanelIDs = app.convertPanelIDs(values["includePanelID"])
 	}
 
-	if req.URL.Query().Has("excludePanelID") {
-		conf.ExcludePanelIDs = app.convertPanelIDs(req.URL.Query()["excludePanelID"])
+	if values.Has("excludePanelID") {
+		conf.ExcludePanelIDs = app.convertPanelIDs(values["excludePanelID"])
 	}
 
-	if req.URL.Query().Has("includePanelDataID") {
-		conf.IncludePanelDataIDs = app.convertPanelIDs(req.URL.Query()["includePanelDataID"])
+	if values.Has("includePanelDataID") {
+		conf.IncludePanelDataIDs = app.convertPanelIDs(values["includePanelDataID"])
 	}
 }
 
@@ -164,42 +164,67 @@ func (app *App) grafanaAppURL(grafanaConfig *config.GrafanaCfg) (string, error) 
 	return strings.TrimSuffix(grafanaAppURL, "/"), nil
 }
 
-// dashboardFolder fetches current dashboard folder from Grafana API.
-func (app *App) dashboardFolder(ctx context.Context, appURL, folderUID string, authHeader http.Header) ([]string, error) {
-	dashURL := fmt.Sprintf("%s/api/folders/%s", appURL, folderUID)
-
+// grafanaAPIGet performs a GET against a Grafana API using exclusively the
+// snapshot's frozen URL and authentication header. Non 2xx responses are
+// returned as apiStatusError; 401/403 additionally wrap errPermissionDenied so
+// callers can fail consistently without retrying under another identity.
+func (app *App) grafanaAPIGet(ctx context.Context, requestURL string, authHeader http.Header) ([]byte, error) {
 	// Create a new GET request
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dashURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil) //nolint:gosec
 	if err != nil {
-		return nil, fmt.Errorf("error creating request for %s: %w", dashURL, err)
+		return nil, fmt.Errorf("error creating request for %s: %w", requestURL, err)
 	}
 
-	// Forward auth headers
-	for name, values := range authHeader {
+	// Forward the frozen auth headers. A clone ensures the snapshot header can
+	// never be mutated through the request.
+	for name, values := range authHeader.Clone() {
 		for _, value := range values {
 			req.Header.Add(name, value)
 		}
 	}
 
 	// Make request
-	resp, err := app.httpClient.Do(req)
+	resp, err := app.httpClient.Do(req) //nolint:gosec
 	if err != nil {
-		return nil, fmt.Errorf("error executing request for %s: %w", dashURL, err)
+		return nil, fmt.Errorf("error executing request for %s: %w", requestURL, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("error reading response body from %s: %w", dashURL, err)
+		return nil, fmt.Errorf("error reading response body from %s: %w", requestURL, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf(
-			"failed to fetch dashboard model: URL: %s. Status: %s, message: %s",
-			dashURL,
-			resp.Status,
-			string(body),
-		)
+		statusErr := &apiStatusError{
+			url:        requestURL,
+			statusCode: resp.StatusCode,
+			status:     resp.Status,
+			body:       string(body),
+		}
+
+		// Authentication/authorization failures must surface as a consistent
+		// failure. The caller must not switch token and retry.
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return nil, fmt.Errorf("%w: %w", errPermissionDenied, statusErr)
+		}
+
+		return nil, statusErr
+	}
+
+	return body, nil
+}
+
+// dashboardFolder fetches current dashboard folder from Grafana API using the
+// frozen snapshot. If the folder tree changes while the report is being
+// generated (folder moved/deleted), the upstream error is returned as-is and
+// the report fails consistently.
+func (app *App) dashboardFolder(snap *reportSnapshot, folderUID string) ([]string, error) {
+	folderURL := fmt.Sprintf("%s/api/folders/%s", snap.grafanaAppURL, folderUID)
+
+	body, err := app.grafanaAPIGet(snap.ctx, folderURL, snap.authHeader)
+	if err != nil {
+		return nil, err
 	}
 
 	var folder dashboard.Folder
@@ -212,6 +237,7 @@ func (app *App) dashboardFolder(ctx context.Context, appURL, folderUID string, a
 
 	// Get folder parents
 	var parentUIDs []string
+
 	for _, parent := range folder.Parents {
 		parentUIDs = append(parentUIDs, parent.UID)
 	}
@@ -219,42 +245,16 @@ func (app *App) dashboardFolder(ctx context.Context, appURL, folderUID string, a
 	return parentUIDs, nil
 }
 
-// dashboardModel fetches dashboard JSON model from Grafana API.
-func (app *App) dashboardModel(ctx context.Context, appURL, dashUID string, authHeader http.Header, values url.Values) (*dashboard.Model, error) {
-	dashURL := fmt.Sprintf("%s/api/dashboards/uid/%s", appURL, dashUID)
+// dashboardModel fetches dashboard JSON model from Grafana API using the
+// frozen snapshot. Both the model and the parent folder UIDs are read with
+// the same identity, so a mid-flight config or token change cannot produce a
+// mixed view.
+func (app *App) dashboardModel(snap *reportSnapshot) (*dashboard.Model, error) {
+	dashURL := fmt.Sprintf("%s/api/dashboards/uid/%s", snap.grafanaAppURL, snap.dashboardUID)
 
-	// Create a new GET request
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dashURL, nil) //nolint:gosec
+	body, err := app.grafanaAPIGet(snap.ctx, dashURL, snap.authHeader)
 	if err != nil {
-		return nil, fmt.Errorf("error creating request for %s: %w", dashURL, err)
-	}
-
-	// Forward auth headers
-	for name, values := range authHeader {
-		for _, value := range values {
-			req.Header.Add(name, value)
-		}
-	}
-
-	// Make request
-	resp, err := app.httpClient.Do(req) //nolint:gosec
-	if err != nil {
-		return nil, fmt.Errorf("error executing request for %s: %w", dashURL, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error reading response body from %s: %w", dashURL, err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf(
-			"failed to fetch dashboard model: URL: %s. Status: %s, message: %s",
-			dashURL,
-			resp.Status,
-			string(body),
-		)
+		return nil, err
 	}
 
 	var model dashboard.Model
@@ -265,14 +265,14 @@ func (app *App) dashboardModel(ctx context.Context, appURL, dashUID string, auth
 		return nil, fmt.Errorf("error reading response body into dashboard model: %w", err)
 	}
 
-	// Add template variables to model
-	model.Dashboard.Variables = values
+	// Add template variables to model from the frozen query parameters
+	model.Dashboard.Variables = snap.query
 
 	// If dashboard is in folder, fetch all parents. Because if permissions is set on
 	// parent folder, they are inherited in the nested dashboards and so, we need to
 	// provide the top level one where permissions are set
 	if model.Meta.FolderUID != "" {
-		folderUIDs, err := app.dashboardFolder(ctx, appURL, model.Meta.FolderUID, authHeader)
+		folderUIDs, err := app.dashboardFolder(snap, model.Meta.FolderUID)
 		if err != nil {
 			return nil, fmt.Errorf("error fetching dashboard folder: %w", err)
 		}
@@ -292,98 +292,41 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var err error
-
-	// Always start with an instance of current app's config
-	conf := app.conf
-
-	// Get context logger which we will use everywhere
-	ctxLogger := log.DefaultLogger.FromContext(req.Context())
-
-	// Get config from context
-	pluginConfig := backend.PluginConfigFromContext(req.Context())
-	currentUser := pluginConfig.User.Login
-
-	// Get Dashboard ID
-	dashboardUID := req.URL.Query().Get("dashUid")
-	if dashboardUID == "" {
-		ctxLogger.Debug("Query parameter dashUid not found")
-		http.Error(w, "missing dashUid query parameter", http.StatusBadRequest)
-
-		return
-	}
-
-	// Add dash uid and user to logger
-	ctxLogger = ctxLogger.With("user", currentUser, "dash_uid", dashboardUID)
-
-	grafanaConfig := config.GrafanaConfigFromContext(req.Context())
-
-	// Get Grafana App URL by looking both at passed config and user defined config
-	grafanaAppURL, err := app.grafanaAppURL(grafanaConfig)
+	// Freeze the requesting user, Grafana URL, auth header, report options,
+	// feature toggles and instance generation at entry. Token resolution
+	// failures abort before any downstream work is started.
+	snap, status, err := app.newReportSnapshot(req)
 	if err != nil {
-		ctxLogger.Error("failed to get app URL", "err", err)
-		http.Error(w, "error generating report", http.StatusInternalServerError)
+		http.Error(w, errText(status), status)
 
 		return
 	}
+	defer snap.close()
 
-	// Update plugin's config from query params
-	app.updateConfig(req, &conf)
+	// Attach the report to its instance generation. Once disposal of this
+	// generation has started, new requests are refused (Grafana routes them to
+	// the new instance) instead of racing teardown.
+	if !app.beginRequest() {
+		snap.logger.Warn("rejecting report request: plugin instance is disposing")
+		http.Error(w, "plugin instance is reloading, please retry", http.StatusServiceUnavailable)
 
-	// Validate new updated config
-	err = conf.RTValidate()
+		return
+	}
+	defer app.inFlight.Done()
+
+	ctxLogger := snap.logger
+
+	// Get dashboard JSON model from API. Both the model and the parent folders
+	// are read exclusively with the frozen identity and URL.
+	model, err := app.dashboardModel(snap)
 	if err != nil {
-		ctxLogger.Debug("invalid config: "+conf.String(), "err", err)
-		http.Error(w, "invalid query parameters found", http.StatusBadRequest)
+		ctxLogger.Error("failed to get dashboard JSON model", "err", err, "generation", snap.generation)
 
-		return
-	}
-
-	ctxLogger.Info("generate report using config: " + conf.String())
-
-	// authHeader is header name value pair that will be used in API requests
-	authHeader := http.Header{}
-
-	switch {
-	// This case is irrelevant starting from Grafana 10.4.4.
-	// This commit https://github.com/grafana/grafana/commit/56a4af87d706087ea42780a79f8043df1b5bc3ea
-	// made changes to not forward the cookies to app plugins.
-	// So we will not be able to use cookies to make requests to Grafana to fetch
-	// dashboards.
-	case req.Header.Get(backend.CookiesHeaderName) != "":
-		ctxLogger.Debug("using user cookie")
-
-		authHeader.Add(backend.CookiesHeaderName, req.Header.Get(backend.CookiesHeaderName))
-	case conf.Token != "":
-		ctxLogger.Debug("using user configured token")
-
-		authHeader.Add(backend.OAuthIdentityTokenHeaderName, "Bearer "+conf.Token)
-	default:
-		ctxLogger.Debug("using service account token")
-
-		saToken, err := grafanaConfig.PluginAppClientSecret()
-		if err != nil {
-			ctxLogger.Error("failed to get plugin app client secret", "err", err)
+		if errors.Is(err, errPermissionDenied) {
+			http.Error(w, "permission denied", http.StatusForbidden)
+		} else {
 			http.Error(w, "error generating report", http.StatusInternalServerError)
-
-			return
 		}
-
-		if saToken == "" {
-			ctxLogger.Error("failed to get plugin app client secret", "err", "empty client secret")
-			http.Error(w, "error generating report", http.StatusInternalServerError)
-
-			return
-		}
-
-		authHeader.Add(backend.OAuthIdentityTokenHeaderName, "Bearer "+saToken)
-	}
-
-	// Get dashboard JSON model from API
-	model, err := app.dashboardModel(req.Context(), grafanaAppURL, dashboardUID, authHeader, req.URL.Query())
-	if err != nil {
-		ctxLogger.Error("failed to get dashboard JSON model", "err", err)
-		http.Error(w, "error generating report", http.StatusInternalServerError)
 
 		return
 	}
@@ -394,7 +337,7 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 		{
 			Kind: "dashboards",
 			Attr: uidAttr,
-			ID:   dashboardUID,
+			ID:   snap.dashboardUID,
 		},
 	}
 	if model.Meta.FolderUID != "" {
@@ -415,14 +358,12 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// If the required feature flags are enabled, check if user has access to the resource
-	// using authz client.
+	// using authz client. The check uses only the frozen id token and the client built
+	// for the frozen service account token.
 	// Here we check if user has permissions to do an action "dashboards:read" on
 	// dashboards resource of a given dashboard UID
-	if app.featureTogglesEnabled(req.Context()) {
-		hasAccess, err := app.HasAccess(
-			req, "dashboards:read",
-			resources...,
-		)
+	if snap.authzEnabled {
+		hasAccess, err := snap.hasAccess("dashboards:read", resources...)
 		if err != nil || !hasAccess {
 			if err != nil {
 				ctxLogger.Error("failed to check permissions", "err", err)
@@ -438,13 +379,13 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 
 	grafanaDashboard, err := dashboard.New(
 		ctxLogger,
-		&conf,
+		&snap.conf,
 		app.httpClient,
 		app.chromeInstance,
-		grafanaAppURL,
+		snap.grafanaAppURL,
 		app.grafanaSemVer,
 		model,
-		authHeader,
+		snap.authHeader,
 	)
 	if err != nil {
 		ctxLogger.Error("failed to create a new dashboard", "err", err)
@@ -458,23 +399,44 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 	// Make app new Report to put all PNGs into app HTML template and print it into app PDF
 	pdfReport := report.New(
 		ctxLogger,
-		&conf,
+		&snap.conf,
 		app.httpClient,
 		app.chromeInstance,
 		app.workerPools,
 		grafanaDashboard,
 	)
 
-	// Generate report
-	err = pdfReport.Generate(req.Context(), w)
+	// Generate report. Every downstream operation is bound to the snapshot
+	// context and uses only snapshot configuration, identity and instance
+	// generation resources.
+	err = pdfReport.Generate(snap.ctx, w)
 	if err != nil {
 		ctxLogger.Error("error generating report", "err", err)
-		http.Error(w, "error generating report", http.StatusInternalServerError)
+
+		if errors.Is(context.Cause(snap.ctx), errInstanceDisposed) {
+			// The instance generation was torn down mid report. Report an
+			// explicit, consistent failure instead of a mixed data view.
+			http.Error(w, "report generation canceled because plugin instance reloaded", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "error generating report", http.StatusInternalServerError)
+		}
 
 		return
 	}
 
 	ctxLogger.Info("report generated")
+}
+
+// errText returns the response body for a given status code.
+func errText(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid request"
+	case http.StatusForbidden:
+		return "permission denied"
+	default:
+		return "error generating report"
+	}
 }
 
 // handleHealth is an example HTTP GET resource that returns an OK response.

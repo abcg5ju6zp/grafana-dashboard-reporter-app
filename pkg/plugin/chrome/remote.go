@@ -26,16 +26,27 @@ func (i *RemoteInstance) Name() string {
 	return "remote"
 }
 
-// NewTab starts and returns a new tab on current browser instance.
-func (i *RemoteInstance) NewTab(logger log.Logger, _ *config.Config) *Tab {
+// NewTab starts and returns a new tab on current browser instance. The tab is
+// bound to ctx: canceling ctx (request snapshot canceled or instance
+// generation disposed) cancels every in-flight browser action of the tab.
+func (i *RemoteInstance) NewTab(ctx context.Context, logger log.Logger, _ *config.Config) *Tab {
 	chromeLogger := logger.With("subsystem", "chromium")
-	browserCtx, _ := chromedp.NewContext(i.allocCtx,
+	browserTabCtx, _ := chromedp.NewContext(i.allocCtx,
 		chromedp.WithErrorf(chromeLogger.Error),
 		chromedp.WithLogf(chromeLogger.Debug),
 	)
 
+	tabCtx, cancelTab := context.WithCancel(browserTabCtx)
+
+	// Propagate snapshot/request cancellation to the browser tab.
+	stopParentWatch := context.AfterFunc(ctx, cancelTab)
+
 	return &Tab{
-		ctx: browserCtx,
+		ctx: tabCtx,
+		cancel: func() {
+			stopParentWatch()
+			cancelTab()
+		},
 	}
 }
 

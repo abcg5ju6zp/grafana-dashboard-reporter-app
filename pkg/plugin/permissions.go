@@ -1,76 +1,32 @@
 package plugin
 
 import (
-	"errors"
-	"net/http"
 	"time"
 
-	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
-	"github.com/grafana/grafana-plugin-sdk-go/config"
 	"github.com/mahendrapaipuri/authlib/authn"
 	"github.com/mahendrapaipuri/authlib/authz"
 	"github.com/mahendrapaipuri/authlib/cache"
 	"github.com/mahendrapaipuri/grafana-dashboard-reporter-app/pkg/plugin/helpers"
 )
 
-// HasAccess verifies if the current request context has access to certain action.
-func (app *App) HasAccess(req *http.Request, action string, resources ...authz.Resource) (bool, error) {
-	// Retrieve the id token
-	idToken := req.Header.Get(GrafanaUserSignInTokenHeaderName)
-	if idToken == "" {
-		return false, errors.New("id token not found")
-	}
-
-	authzClient, err := app.GetAuthZClient(req)
-	if err != nil {
-		return false, err
-	}
-
-	// Check user access
-	hasAccess, err := authzClient.HasAccess(req.Context(), idToken, action, resources...)
-	if err != nil || !hasAccess {
-		return false, err
-	}
-
-	return true, nil
-}
-
-// GetAuthZClient returns an authz enforcement client configured thanks to the plugin context.
-func (app *App) GetAuthZClient(req *http.Request) (authz.EnforcementClient, error) {
-	ctx := req.Context()
-	ctxLogger := log.DefaultLogger.FromContext(ctx)
-
-	// Prevent two concurrent calls from updating the client
+// authzClientFor returns an authorization enforcement client for the frozen
+// Grafana URL and token pair. Clients are cached per token so that a token
+// rotation can never make an in-flight request silently use the client (and
+// the identity) built for another request.
+//
+// All inputs come from a request snapshot and are immutable for the lifetime
+// of the report.
+func (app *App) authzClientFor(grafanaAppURL, token string) (authz.EnforcementClient, error) {
+	// Prevent two concurrent calls from creating the same client
 	app.mx.Lock()
 	defer app.mx.Unlock()
 
-	grafanaConfig := config.GrafanaConfigFromContext(req.Context())
+	cacheKey := grafanaAppURL + "\x00" + token
 
-	grafanaAppURL, err := app.grafanaAppURL(grafanaConfig)
-	if err != nil {
-		ctxLogger.Error("failed to get app URL", "err", err)
+	if client, ok := app.authzClients[cacheKey]; ok {
+		app.ctxLogger.Debug("token unchanged returning existing authz client")
 
-		return nil, err
-	}
-
-	// Bail we cannot get token provisioned by externalServiceAccount and no token
-	// has been manually configured. In this case we cannot check permissions and moreover
-	// we cannot make API requests to Grafana
-	saToken, err := grafanaConfig.PluginAppClientSecret()
-	if err != nil && app.conf.Token == "" {
-		ctxLogger.Error("failed to fetch service account and configured token", "error", err)
-
-		return nil, err
-	} else {
-		if saToken == "" {
-			saToken = app.conf.Token
-		}
-	}
-
-	if saToken == app.saToken {
-		ctxLogger.Debug("token unchanged returning existing authz client")
-
-		return app.authzClient, nil
+		return client, nil
 	}
 
 	// Header "typ" has been added only in Grafana 11.1.0 (https://github.com/grafana/grafana/pull/87430)
@@ -84,7 +40,7 @@ func (app *App) GetAuthZClient(req *http.Request) (authz.EnforcementClient, erro
 	// Initialize the authorization client
 	client, err := authz.NewEnforcementClient(authz.Config{
 		APIURL: grafanaAppURL,
-		Token:  saToken,
+		Token:  token,
 		// Grafana is signing the JWTs on local setups
 		JWKsURL: grafanaAppURL + "/api/signing-keys/keys",
 	},
@@ -111,13 +67,10 @@ func (app *App) GetAuthZClient(req *http.Request) (authz.EnforcementClient, erro
 		})),
 	)
 	if err != nil {
-		ctxLogger.Error("failed to initialize authz client", "err", err)
-
 		return nil, err
 	}
 
-	app.authzClient = client
-	app.saToken = saToken
+	app.authzClients[cacheKey] = client
 
 	return client, nil
 }
