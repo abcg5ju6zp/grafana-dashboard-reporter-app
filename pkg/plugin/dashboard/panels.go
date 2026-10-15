@@ -74,8 +74,9 @@ func (d *Dashboard) panels(ctx context.Context) ([]Panel, error) {
 
 // panelMetaData fetches dashboard panels metadata from Grafana chromium browser instance.
 func (d *Dashboard) panelMetaData(_ context.Context) ([]any, error) {
-	// Get dashboard URL
-	dashURL := fmt.Sprintf("%s/d/%s/_?%s", d.appURL, d.model.Dashboard.UID, d.model.Dashboard.Variables.Encode())
+	// Get dashboard URL. Use the snapshot variables so the browser loads the
+	// exact model version and absolute time window bound to this report.
+	dashURL := fmt.Sprintf("%s/d/%s/_?%s", d.appURL, d.snapshot.model.Dashboard.UID, d.snapshot.variables.Encode())
 
 	defer helpers.TimeTrack(time.Now(), "fetch dashboard panels metadata", d.logger, "url", dashURL)
 
@@ -234,8 +235,8 @@ func (d *Dashboard) createPanels(dashData []any) ([]Panel, error) {
 			pID = p.ID
 		}
 
-		// Populate Repeat var from dashboard JSON model
-		for _, rowOrPanel := range d.model.Dashboard.RowOrPanels {
+		// Populate Repeat var from dashboard snapshot JSON model
+		for _, rowOrPanel := range d.snapshot.model.Dashboard.RowOrPanels {
 			if rowOrPanel.Type == "row" {
 				for _, rp := range rowOrPanel.Panels {
 					if rp.ID == pID {

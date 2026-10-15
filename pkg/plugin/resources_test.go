@@ -112,3 +112,98 @@ func TestReportResource(t *testing.T) {
 		})
 	})
 }
+
+// TestReportSnapshotErrors covers status mapping for failures that happen
+// before the browser is involved, so they run without a renderable Grafana.
+func TestReportSnapshotErrors(t *testing.T) {
+	var execPath string
+
+	locations := []string{
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"chrome.exe",
+		"google-chrome",
+		"chrome",
+	}
+
+	for _, path := range locations {
+		found, err := exec.LookPath(path)
+		if err == nil {
+			execPath = found
+
+			break
+		}
+	}
+
+	if execPath == "" {
+		t.Skip("Chrome not found. Skipping test")
+	}
+
+	inst, err := NewDashboardReporterApp(t.Context(), backend.AppInstanceSettings{
+		DecryptedSecureJSONData: map[string]string{
+			plugin_config.SaToken: "token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("new app: %s", err)
+	}
+
+	app, ok := inst.(*App)
+	if !ok {
+		t.Fatal("inst must be of type *App")
+	}
+
+	Convey("When Grafana forbids reading the dashboard", t, func() {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}))
+		defer ts.Close()
+
+		ctx := config.WithGrafanaConfig(t.Context(), config.NewGrafanaCfg(map[string]string{
+			backend.AppURL: ts.URL,
+		}))
+
+		var r mockCallResourceResponseSender
+
+		err = app.CallResource(ctx, &backend.CallResourceRequest{
+			PluginContext: backend.PluginContext{
+				Namespace: "3",
+				PluginID:  "my-plugin",
+				User:      &backend.User{Name: "foobar", Email: "foo@bar.com", Login: "foo@bar.com"},
+			},
+			Method: http.MethodGet,
+			Path:   "report?dashUid=testDash",
+		}, &r)
+
+		So(err, ShouldBeNil)
+		So(r.response.Status, ShouldEqual, http.StatusForbidden)
+	})
+
+	Convey("When the request carries an invalid relative time", t, func() {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, err := w.Write([]byte(`{"dashboard": {"title": "foo","version":2,"panels":[]}}`))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+		}))
+		defer ts.Close()
+
+		ctx := config.WithGrafanaConfig(t.Context(), config.NewGrafanaCfg(map[string]string{
+			backend.AppURL: ts.URL,
+		}))
+
+		var r mockCallResourceResponseSender
+
+		err = app.CallResource(ctx, &backend.CallResourceRequest{
+			PluginContext: backend.PluginContext{
+				Namespace: "3",
+				PluginID:  "my-plugin",
+				User:      &backend.User{Name: "foobar", Email: "foo@bar.com", Login: "foo@bar.com"},
+			},
+			Method: http.MethodGet,
+			Path:   "report?dashUid=testDash&from=not-a-time&to=now",
+		}, &r)
+
+		So(err, ShouldBeNil)
+		So(r.response.Status, ShouldEqual, http.StatusBadRequest)
+	})
+}

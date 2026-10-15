@@ -1,6 +1,7 @@
 package report
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -11,13 +12,33 @@ import (
 	"github.com/mahendrapaipuri/grafana-dashboard-reporter-app/pkg/plugin/worker"
 )
 
+// dashboardReport is the subset of *dashboard.Dashboard used by Report. It
+// allows replacing the browser backed dashboard with a fake in tests.
+type dashboardReport interface {
+	GetData(ctx context.Context) (*dashboard.Data, error)
+	CheckVersion(ctx context.Context) error
+	ReplaceSnapshot(snapshot *dashboard.Snapshot)
+	PanelPNG(ctx context.Context, panel dashboard.Panel) (dashboard.PanelImage, error)
+	PanelCSV(ctx context.Context, panel dashboard.Panel) (dashboard.CSVData, error)
+}
+
 type Report struct {
 	logger         log.Logger
 	conf           *config.Config
 	httpClient     *http.Client
 	chromeInstance chrome.Instance
 	pools          worker.Pools
-	dashboard      *dashboard.Dashboard
+	dashboard      dashboardReport
+	// newSnapshot, when configured, rebuilds a complete report snapshot
+	// (fresh model version, folder permission resources and absolute time
+	// window) after a dashboard version change has been detected.
+	newSnapshot dashboard.SnapshotFunc
+}
+
+// SetSnapshotBuilder injects the function used to rebuild a report snapshot
+// when the dashboard changes during report generation.
+func (r *Report) SetSnapshotBuilder(builder dashboard.SnapshotFunc) {
+	r.newSnapshot = builder
 }
 
 type HTML struct {

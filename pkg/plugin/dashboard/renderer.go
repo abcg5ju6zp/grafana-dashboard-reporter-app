@@ -165,7 +165,10 @@ func (d *Dashboard) panelPNGImageRenderer(ctx context.Context, p Panel) (PanelIm
 
 // panelPNGURL returns the URL to fetch panel PNG.
 func (d *Dashboard) panelPNGURL(p Panel, render bool) string {
-	values := maps.Clone(d.model.Dashboard.Variables)
+	// Clone the snapshot variables: from/to are the absolute window resolved
+	// once at the report entry, so both the native browser and the remote
+	// grafana-image-renderer query the exact same time range as the model.
+	values := maps.Clone(d.snapshot.variables)
 	pID := p.ID
 
 	// UPDATE: 20260209
@@ -275,7 +278,7 @@ func (d *Dashboard) panelPNGURL(p Panel, render bool) string {
 	}
 
 	// Get Panel API endpoint
-	return fmt.Sprintf("%s/%sd-solo/%s/_?%s", d.appURL, renderer, d.model.Dashboard.UID, values.Encode())
+	return fmt.Sprintf("%s/%sd-solo/%s/_?%s", d.appURL, renderer, d.snapshot.model.Dashboard.UID, values.Encode())
 }
 
 // panelDims returns width and height of panel based on layout.

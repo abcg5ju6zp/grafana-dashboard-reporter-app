@@ -3,12 +3,14 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
@@ -19,6 +21,29 @@ import (
 	"github.com/mahendrapaipuri/grafana-dashboard-reporter-app/pkg/plugin/helpers"
 	"github.com/mahendrapaipuri/grafana-dashboard-reporter-app/pkg/plugin/report"
 )
+
+// Sentinel errors used to map report generation failures onto HTTP statuses.
+var (
+	// errPermissionDenied is returned when the user is not allowed to read the
+	// dashboard (or any of its parent folders) of a snapshot.
+	errPermissionDenied = errors.New("permission denied")
+)
+
+// statusError is an error carrying the HTTP status returned by Grafana API.
+type statusError struct {
+	status  int
+	apiURL  string
+	message string
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf(
+		"grafana API request failed: URL: %s. Status: %d, message: %s",
+		e.apiURL,
+		e.status,
+		e.message,
+	)
+}
 
 // GrafanaUserSignInTokenHeaderName the header name used for forwarding
 // the SignIn token of a Grafana User.
@@ -194,12 +219,11 @@ func (app *App) dashboardFolder(ctx context.Context, appURL, folderUID string, a
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf(
-			"failed to fetch dashboard model: URL: %s. Status: %s, message: %s",
-			dashURL,
-			resp.Status,
-			string(body),
-		)
+		return nil, &statusError{
+			status:  resp.StatusCode,
+			apiURL:  dashURL,
+			message: string(body),
+		}
 	}
 
 	var folder dashboard.Folder
@@ -249,12 +273,11 @@ func (app *App) dashboardModel(ctx context.Context, appURL, dashUID string, auth
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf(
-			"failed to fetch dashboard model: URL: %s. Status: %s, message: %s",
-			dashURL,
-			resp.Status,
-			string(body),
-		)
+		return nil, &statusError{
+			status:  resp.StatusCode,
+			apiURL:  dashURL,
+			message: string(body),
+		}
 	}
 
 	var model dashboard.Model
@@ -379,17 +402,128 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 		authHeader.Add(backend.OAuthIdentityTokenHeaderName, "Bearer "+saToken)
 	}
 
-	// Get dashboard JSON model from API
-	model, err := app.dashboardModel(req.Context(), grafanaAppURL, dashboardUID, authHeader, req.URL.Query())
+	// buildSnapshot reads the dashboard model and its folder permission
+	// resources as they are stored right now, enforces that the current user
+	// can read them and binds that model version together with one absolute
+	// time window (resolved once from the request's possibly relative from/to)
+	// into an immutable snapshot.
+	//
+	// The same closure is used for the initial snapshot and for rebuilding a
+	// complete candidate after the dashboard has been saved during generation.
+	buildSnapshot := func(ctx context.Context) (*dashboard.Snapshot, error) {
+		// Get dashboard JSON model from API
+		model, err := app.dashboardModel(ctx, grafanaAppURL, dashboardUID, authHeader, req.URL.Query())
+		if err != nil {
+			return nil, fmt.Errorf("failed to get dashboard JSON model: %w", err)
+		}
+
+		// Build the permission resources from THIS model version: the dashboard
+		// itself, its folder and all parent folders.
+		resources := dashboardResources(dashboardUID, model)
+
+		// If the required feature flags are enabled, check if user has access to the resource
+		// using authz client.
+		// Here we check if user has permissions to do an action "dashboards:read" on
+		// dashboards resource of a given dashboard UID.
+		//
+		// This runs on every snapshot (including rebuilds after a version change),
+		// so a permission change always fails the current generation directly,
+		// without reusing previous permission results.
+		if app.featureTogglesEnabled(ctx) {
+			hasAccess, err := app.HasAccess(req, "dashboards:read", resources...)
+			if err != nil {
+				return nil, fmt.Errorf("failed to check permissions: %w", err)
+			}
+
+			if !hasAccess {
+				return nil, errPermissionDenied
+			}
+		}
+
+		// Pin relative from/to to a single absolute window for this snapshot.
+		snapshot, err := dashboard.NewSnapshot(model, time.Now())
+		if err != nil {
+			return nil, &statusError{
+				status:  http.StatusBadRequest,
+				apiURL:  req.URL.String(),
+				message: err.Error(),
+			}
+		}
+
+		return snapshot, nil
+	}
+
+	// Build the initial report snapshot at the request entry.
+	snapshot, err := buildSnapshot(req.Context())
 	if err != nil {
-		ctxLogger.Error("failed to get dashboard JSON model", "err", err)
+		ctxLogger.Error("failed to build dashboard snapshot", "err", err)
+		respondReportError(w, err)
+
+		return
+	}
+
+	ctxLogger.Info("report snapshot bound", "dashboard_version", snapshot.Version(),
+		"from", snapshot.From, "to", snapshot.To)
+
+	grafanaDashboard, err := dashboard.New(
+		ctxLogger,
+		&conf,
+		app.httpClient,
+		app.chromeInstance,
+		grafanaAppURL,
+		app.grafanaSemVer,
+		snapshot,
+		authHeader,
+	)
+	if err != nil {
+		ctxLogger.Error("failed to create a new dashboard", "err", err)
 		http.Error(w, "error generating report", http.StatusInternalServerError)
 
 		return
 	}
 
-	// If dashboard is in a folder, check if user has permissions on either the dashboard
-	// or the folder.
+	// Version fetcher used at every stage boundary to detect dashboard saves
+	// happening while the report is being assembled.
+	grafanaDashboard.SetVersionFetcher(func(ctx context.Context) (int, error) {
+		freshModel, err := app.dashboardModel(ctx, grafanaAppURL, dashboardUID, authHeader, req.URL.Query())
+		if err != nil {
+			return 0, fmt.Errorf("failed to refresh dashboard version: %w", err)
+		}
+
+		return freshModel.Dashboard.Version, nil
+	})
+
+	ctxLogger.Info(fmt.Sprintf("generate report using %s chrome", app.chromeInstance.Name()))
+
+	// Make app new Report to put all PNGs into app HTML template and print it into app PDF
+	pdfReport := report.New(
+		ctxLogger,
+		&conf,
+		app.httpClient,
+		app.chromeInstance,
+		app.workerPools,
+		grafanaDashboard,
+	)
+
+	// Allow the report to rebuild a complete candidate from a fresh snapshot
+	// when the dashboard changes during generation.
+	pdfReport.SetSnapshotBuilder(buildSnapshot)
+
+	// Generate report
+	err = pdfReport.Generate(req.Context(), w)
+	if err != nil {
+		ctxLogger.Error("error generating report", "err", err)
+		respondReportError(w, err)
+
+		return
+	}
+
+	ctxLogger.Info("report generated")
+}
+
+// dashboardResources builds the authz resources (dashboard, its folder and all
+// parent folders) associated with a given dashboard model version.
+func dashboardResources(dashboardUID string, model *dashboard.Model) []authz.Resource {
 	resources := []authz.Resource{
 		{
 			Kind: "dashboards",
@@ -397,6 +531,7 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 			ID:   dashboardUID,
 		},
 	}
+
 	if model.Meta.FolderUID != "" {
 		resources = append(resources, authz.Resource{
 			Kind: "folders",
@@ -414,67 +549,32 @@ func (app *App) handleReport(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// If the required feature flags are enabled, check if user has access to the resource
-	// using authz client.
-	// Here we check if user has permissions to do an action "dashboards:read" on
-	// dashboards resource of a given dashboard UID
-	if app.featureTogglesEnabled(req.Context()) {
-		hasAccess, err := app.HasAccess(
-			req, "dashboards:read",
-			resources...,
-		)
-		if err != nil || !hasAccess {
-			if err != nil {
-				ctxLogger.Error("failed to check permissions", "err", err)
-			} else {
-				ctxLogger.Error("user does not have necessary permissions to view dashboard")
-			}
+	return resources
+}
 
+// respondReportError maps report generation errors onto the appropriate HTTP
+// status. A continuously modified dashboard yields 409 Conflict, permission
+// failures yield 403 Forbidden and upstream API statuses are forwarded.
+func respondReportError(w http.ResponseWriter, err error) {
+	var apiErr *statusError
+
+	switch {
+	case errors.Is(err, report.ErrReportConflict):
+		http.Error(w, "dashboard has been modified while generating the report, please retry", http.StatusConflict)
+	case errors.Is(err, errPermissionDenied):
+		http.Error(w, "permission denied", http.StatusForbidden)
+	case errors.As(err, &apiErr):
+		switch apiErr.status {
+		case http.StatusForbidden, http.StatusUnauthorized:
 			http.Error(w, "permission denied", http.StatusForbidden)
-
-			return
+		case http.StatusBadRequest:
+			http.Error(w, "invalid query parameters found", http.StatusBadRequest)
+		default:
+			http.Error(w, "error generating report", http.StatusInternalServerError)
 		}
-	}
-
-	grafanaDashboard, err := dashboard.New(
-		ctxLogger,
-		&conf,
-		app.httpClient,
-		app.chromeInstance,
-		grafanaAppURL,
-		app.grafanaSemVer,
-		model,
-		authHeader,
-	)
-	if err != nil {
-		ctxLogger.Error("failed to create a new dashboard", "err", err)
+	default:
 		http.Error(w, "error generating report", http.StatusInternalServerError)
-
-		return
 	}
-
-	ctxLogger.Info(fmt.Sprintf("generate report using %s chrome", app.chromeInstance.Name()))
-
-	// Make app new Report to put all PNGs into app HTML template and print it into app PDF
-	pdfReport := report.New(
-		ctxLogger,
-		&conf,
-		app.httpClient,
-		app.chromeInstance,
-		app.workerPools,
-		grafanaDashboard,
-	)
-
-	// Generate report
-	err = pdfReport.Generate(req.Context(), w)
-	if err != nil {
-		ctxLogger.Error("error generating report", "err", err)
-		http.Error(w, "error generating report", http.StatusInternalServerError)
-
-		return
-	}
-
-	ctxLogger.Info("report generated")
 }
 
 // handleHealth is an example HTTP GET resource that returns an OK response.

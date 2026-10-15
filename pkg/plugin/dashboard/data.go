@@ -138,12 +138,14 @@ func (d *Dashboard) PanelCSV(_ context.Context, p Panel) (CSVData, error) {
 
 // panelCSVURL returns URL to fetch panel's CSV data.
 func (d *Dashboard) panelCSVURL(p Panel) string {
-	values := maps.Clone(d.model.Dashboard.Variables)
+	// Clone the snapshot variables so that the CSV download queries the very
+	// same absolute time window as the model and the panel PNGs.
+	values := maps.Clone(d.snapshot.variables)
 	values.Add("theme", d.conf.Theme)
 	values.Add("viewPanel", p.ID)
 	values.Add("inspect", p.ID)
 	values.Add("inspectTab", "data")
 
 	// Get Panel CSV API endpoint
-	return fmt.Sprintf("%s/d/%s/_?%s", d.appURL, d.model.Dashboard.UID, values.Encode())
+	return fmt.Sprintf("%s/d/%s/_?%s", d.appURL, d.snapshot.model.Dashboard.UID, values.Encode())
 }

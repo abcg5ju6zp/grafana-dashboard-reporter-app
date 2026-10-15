@@ -1,11 +1,13 @@
 package dashboard
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/mahendrapaipuri/grafana-dashboard-reporter-app/pkg/plugin/chrome"
@@ -21,8 +23,13 @@ type Dashboard struct {
 	appURL         *url.URL
 	appVersion     string
 	jsContent      string
-	model          *Model
+	snapshot       *Snapshot
 	authHeader     http.Header
+	// versionFetcher returns the version of the dashboard as it is currently
+	// stored in Grafana. When set, it is compared against the snapshot version
+	// at every stage boundary so that a candidate mixing several dashboard
+	// versions can never be published.
+	versionFetcher func(ctx context.Context) (int, error)
 }
 
 // RowOrPanel represents a container for Panels.
@@ -46,6 +53,7 @@ type Model struct {
 		UID         string       `json:"uid"`
 		Title       string       `json:"title"`
 		Description string       `json:"description"`
+		Version     int          `json:"version"`
 		RowOrPanels []RowOrPanel `json:"panels"`
 		Panels      []Panel
 		Variables   url.Values
@@ -64,10 +72,14 @@ type Folder struct {
 
 // Data represents dashboard data that will be included in the report.
 type Data struct {
-	Title     string
+	Title string
+	// TimeRange is the absolute window resolved once at the report entry and
+	// shared by every downstream query and by the rendered header.
 	TimeRange TimeRange
 	Variables string
 	Panels    []Panel
+	// GeneratedAt is the snapshot reference instant used for the report header.
+	GeneratedAt time.Time
 }
 
 type PanelType int

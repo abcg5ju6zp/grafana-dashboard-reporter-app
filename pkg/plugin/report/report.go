@@ -40,8 +40,13 @@ var popularSignatures = map[string]string{
 	"Qk02U":       "image/bmp",
 }
 
+// ErrReportConflict is returned when the dashboard keeps changing while a
+// report is being generated and the request deadline is reached. No stale
+// candidate is ever published; the client must retry the report.
+var ErrReportConflict = errors.New("dashboard modified during report generation; please retry")
+
 func New(logger log.Logger, conf *config.Config, httpClient *http.Client, chromeInstance chrome.Instance,
-	pools worker.Pools, dashboard *dashboard.Dashboard,
+	pools worker.Pools, dashboard dashboardReport,
 ) *Report {
 	return &Report{
 		logger,
@@ -50,31 +55,67 @@ func New(logger log.Logger, conf *config.Config, httpClient *http.Client, chrome
 		chromeInstance,
 		pools,
 		dashboard,
+		nil,
 	}
 }
 
+// Generate builds the report and writes it to the response writer.
+//
+// A complete candidate (panel metadata, PNGs and CSV data) is assembled
+// against a single immutable snapshot: one dashboard model version and one
+// absolute time window. If the dashboard is saved at any point while a
+// candidate is being assembled, the whole candidate is discarded and a new
+// candidate is rebuilt from scratch against the latest version. Panels from
+// different versions are therefore never mixed into one report. If the
+// dashboard keeps changing until the request deadline, ErrReportConflict is
+// returned and nothing is written to the response.
 func (r *Report) Generate(ctx context.Context, writer http.ResponseWriter) error {
 	defer helpers.TimeTrack(time.Now(), "report generation", r.logger)
 
-	// Get panel data from dashboard
-	dashboardData, err := r.dashboard.GetData(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get dashboard data: %w", err)
-	}
+	var (
+		htmlReport    HTML
+		dashboardData *dashboard.Data
+	)
 
-	// Populate panels with PNG and tabular data
-	err = r.populatePanels(ctx, dashboardData)
-	if err != nil {
-		return fmt.Errorf("failed to populate panels: %w", err)
-	}
+	// attempts counts discarded candidates, i.e. how many times the dashboard
+	// version changed during generation.
+	attempts := 0
 
-	// panelTables = slices.DeleteFunc(panelTables, func(panelTable dashboard.PanelTable) bool {
-	// 	return panelTable.Data == nil
-	// })
+	for {
+		// Build a complete candidate bound to the current snapshot.
+		data, err := r.buildCandidate(ctx)
+		if err == nil {
+			dashboardData = data
 
-	htmlReport, err := r.generateHTMLFile(dashboardData)
-	if err != nil {
-		return fmt.Errorf("failed to generate HTML file: %w", err)
+			htmlReport, err = r.generateHTMLFile(data)
+			if err != nil {
+				return fmt.Errorf("failed to generate HTML file: %w", err)
+			}
+
+			// The candidate is fully assembled in memory and still consistent.
+			// From this point on Grafana is not queried anymore, so it is safe
+			// to publish.
+			break
+		}
+
+		if !errors.Is(err, dashboard.ErrDashboardVersionChanged) {
+			// If the request expired while chasing a continuously modified
+			// dashboard, surface a conflict instead of any stale candidate.
+			if attempts > 0 && ctx.Err() != nil {
+				return ErrReportConflict
+			}
+
+			return err
+		}
+
+		// Dashboard version changed: discard this candidate, rotate the
+		// snapshot to the latest version and rebuild a complete candidate.
+		err = r.rebuildSnapshot(ctx)
+		if err != nil {
+			return err
+		}
+
+		attempts++
 	}
 
 	if r.conf.ReportFormat == "html" {
@@ -88,11 +129,86 @@ func (r *Report) Generate(ctx context.Context, writer http.ResponseWriter) error
 		header := fmt.Sprintf(`inline; filename*=UTF-8''%s.pdf`, filename)
 		writer.Header().Add("Content-Disposition", header)
 
-		err = r.renderPDF(htmlReport, writer)
+		err := r.renderPDF(htmlReport, writer)
 		if err != nil {
 			return fmt.Errorf("failed to render PDF: %w", err)
 		}
 	}
+
+	return nil
+}
+
+// buildCandidate assembles one complete report candidate from the current
+// snapshot. Panel metadata, PNG and CSV downloads all come from the same
+// model version and absolute time window. The dashboard version is checked at
+// every stage boundary; on mismatch the caller discards the candidate and
+// rebuilds against a fresh snapshot.
+func (r *Report) buildCandidate(ctx context.Context) (*dashboard.Data, error) {
+	// Get panel data from dashboard
+	dashboardData, err := r.dashboard.GetData(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get dashboard data: %w", err)
+	}
+
+	// The browser may have rendered a dashboard saved after the snapshot was
+	// read. Never mix the snapshot model with a newer layout.
+	err = r.dashboard.CheckVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Populate panels with PNG and tabular data
+	populateErr := r.populatePanels(ctx, dashboardData)
+	if populateErr != nil {
+		return nil, fmt.Errorf("failed to populate panels: %w", populateErr)
+	}
+
+	// PNG/CSV downloads reopen the dashboard many times and can take long.
+	// Before any result is published, verify that the dashboard has not been
+	// saved in the meantime. If it has, all panels of this attempt are
+	// invalidated and the candidate is discarded.
+	err = r.dashboard.CheckVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return dashboardData, nil
+}
+
+// rebuildSnapshot replaces the current snapshot with a freshly read one after
+// a dashboard version change has been detected. Permission denials while
+// rebuilding fail the report directly, and a request that expires while the
+// dashboard keeps changing results in ErrReportConflict rather than in an old
+// report.
+func (r *Report) rebuildSnapshot(ctx context.Context) error {
+	// Do not rebuild past the request deadline.
+	ctxErr := ctx.Err()
+	if ctxErr != nil {
+		r.logger.Warn("request deadline reached while dashboard keeps changing; returning conflict")
+
+		return ErrReportConflict
+	}
+
+	// Without a snapshot builder the report cannot be rebuilt safely, so never
+	// fall back to stale data.
+	if r.newSnapshot == nil {
+		return ErrReportConflict
+	}
+
+	snapshot, err := r.newSnapshot(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			r.logger.Warn("request deadline reached while rebuilding snapshot; returning conflict")
+
+			return ErrReportConflict
+		}
+
+		return fmt.Errorf("failed to rebuild report snapshot: %w", err)
+	}
+
+	r.dashboard.ReplaceSnapshot(snapshot)
+
+	r.logger.Info("rebuilt report candidate from new dashboard snapshot", "dashboard_version", snapshot.Version())
 
 	return nil
 }
@@ -209,9 +325,18 @@ func (r *Report) generateHTMLFile(dashboardData *dashboard.Data) (HTML, error) {
 		return HTML{}, fmt.Errorf("error parsing PDF template: %w", err)
 	}
 
+	// Use the snapshot reference instant for the header so that the displayed
+	// generation time comes from the same observation moment as the rest of the
+	// report. Fall back to the current time only when no snapshot timestamp is
+	// available (for instance in unit tests).
+	generatedAt := dashboardData.GeneratedAt
+	if generatedAt.IsZero() {
+		generatedAt = time.Now()
+	}
+
 	// Template data
 	data := templateData{
-		time.Now().Local().In(r.conf.Location).Format(r.conf.TimeFormat),
+		generatedAt.Local().In(r.conf.Location).Format(r.conf.TimeFormat),
 		dashboardData,
 		r.conf,
 	}

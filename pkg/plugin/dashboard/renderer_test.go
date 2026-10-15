@@ -19,6 +19,15 @@ func init() {
 	getPanelRetrySleepTime = time.Duration(1) * time.Millisecond
 }
 
+func newTestModel(uid string, variables url.Values) *Model {
+	model := &Model{}
+	model.Dashboard.UID = uid
+	model.Dashboard.Version = 3
+	model.Dashboard.Variables = variables
+
+	return model
+}
+
 func TestFetchPanelPNG(t *testing.T) {
 	Convey("When fetching a panel PNG", t, func() {
 		requestURI := ""
@@ -40,6 +49,12 @@ func TestFetchPanelPNG(t *testing.T) {
 		variables.Add("from", "now-1h")
 		variables.Add("to", "now")
 
+		// Relative from/to are resolved once against this fixed reference time
+		// and pinned to epoch milliseconds for the whole snapshot.
+		refTime := time.UnixMilli(1734198065000)
+
+		snap, snapErr := NewSnapshot(newTestModel("randomUID", variables), refTime)
+
 		dash, err := New(
 			log.NewNullLogger(),
 			&conf,
@@ -47,22 +62,19 @@ func TestFetchPanelPNG(t *testing.T) {
 			&chrome.LocalInstance{},
 			ts.URL+"/grafana", // With path prefix
 			"v11.1.0",
-			&Model{Dashboard: struct {
-				ID          int          `json:"id"`
-				UID         string       `json:"uid"`
-				Title       string       `json:"title"`
-				Description string       `json:"description"`
-				RowOrPanels []RowOrPanel `json:"panels"`
-				Panels      []Panel
-				Variables   url.Values
-			}{
-				UID:       "randomUID",
-				Variables: variables,
-			}},
+			snap,
 			http.Header{
 				backend.OAuthIdentityTokenHeaderName: []string{"Bearer token"},
 			},
 		)
+
+		Convey("Snapshot should resolve relative times to one absolute window", func() {
+			So(snapErr, ShouldBeNil)
+			So(snap.To.UnixMilli(), ShouldEqual, int64(1734198065000))
+			So(snap.From.UnixMilli(), ShouldEqual, int64(1734194465000))
+			So(snap.Variables().Get("from"), ShouldEqual, "1734194465000")
+			So(snap.Variables().Get("to"), ShouldEqual, "1734198065000")
+		})
 
 		Convey("New dashboard should receive no errors", func() {
 			So(err, ShouldBeNil)
@@ -82,9 +94,11 @@ func TestFetchPanelPNG(t *testing.T) {
 			So(requestURI, ShouldContainSubstring, "panelId=44")
 		})
 
-		Convey("The httpClient should request the time", func() {
-			So(requestURI, ShouldContainSubstring, "from=now-1h")
-			So(requestURI, ShouldContainSubstring, "to=now")
+		Convey("The httpClient should request the pinned absolute time window", func() {
+			So(requestURI, ShouldContainSubstring, "from=1734194465000")
+			So(requestURI, ShouldContainSubstring, "to=1734198065000")
+			So(requestURI, ShouldNotContainSubstring, "from=now-1h")
+			So(requestURI, ShouldNotContainSubstring, "to=now")
 		})
 
 		Convey("The httpClient should insert auth token should in request header", func() {
@@ -111,18 +125,7 @@ func TestFetchPanelPNG(t *testing.T) {
 			&chrome.LocalInstance{},
 			ts.URL,
 			"v11.1.0",
-			&Model{Dashboard: struct {
-				ID          int          `json:"id"`
-				UID         string       `json:"uid"`
-				Title       string       `json:"title"`
-				Description string       `json:"description"`
-				RowOrPanels []RowOrPanel `json:"panels"`
-				Panels      []Panel
-				Variables   url.Values
-			}{
-				UID:       "randomUID",
-				Variables: variables,
-			}},
+			snap,
 			http.Header{
 				backend.OAuthIdentityTokenHeaderName: []string{"token"},
 			},
@@ -136,6 +139,11 @@ func TestFetchPanelPNG(t *testing.T) {
 
 		Convey("It should receives no errors using grid layout", func() {
 			So(err, ShouldBeNil)
+		})
+
+		Convey("The httpClient should still use the same absolute time window", func() {
+			So(requestURI, ShouldContainSubstring, "from=1734194465000")
+			So(requestURI, ShouldContainSubstring, "to=1734198065000")
 		})
 
 		Convey("The httpClient should request singlestat panels at grid layout size", func() {

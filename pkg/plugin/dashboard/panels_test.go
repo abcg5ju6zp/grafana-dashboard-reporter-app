@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/httpclient"
@@ -20,6 +21,20 @@ import (
 )
 
 var muLock sync.RWMutex
+
+// testSnapshot builds a snapshot for a dashboard UID without explicit
+// variables; relative from/to still get pinned once.
+func testSnapshot(uid string) *Snapshot {
+	model := &Model{}
+	model.Dashboard.UID = uid
+
+	snap, err := NewSnapshot(model, time.UnixMilli(1734198065000))
+	if err != nil {
+		panic(err)
+	}
+
+	return snap
+}
 
 func TestDashboardFetchWithLocalChrome(t *testing.T) {
 	var execPath string
@@ -109,17 +124,7 @@ func TestDashboardFetchWithLocalChrome(t *testing.T) {
 				chromeInstance,
 				ts.URL,
 				"v11.4.0",
-				&Model{Dashboard: struct {
-					ID          int          `json:"id"`
-					UID         string       `json:"uid"`
-					Title       string       `json:"title"`
-					Description string       `json:"description"`
-					RowOrPanels []RowOrPanel `json:"panels"`
-					Panels      []Panel
-					Variables   url.Values
-				}{
-					UID: "randomUID",
-				}},
+				testSnapshot("randomUID"),
 				http.Header{
 					backend.CookiesHeaderName: []string{"cookie"},
 				},
@@ -134,8 +139,8 @@ func TestDashboardFetchWithLocalChrome(t *testing.T) {
 			Convey("It should receive no errors", func() {
 				So(err, ShouldBeNil)
 			})
-			Convey("It should use dashboards endpoint", func() {
-				So(requestURI, ShouldContain, "/d/randomUID/_?")
+			Convey("It should use dashboards endpoint with the pinned absolute time window", func() {
+				So(strings.Join(requestURI, ","), ShouldContainSubstring, "/d/randomUID/_?from=1734194465000&to=1734198065000")
 			})
 			Convey("It should use cookie", func() {
 				So(requestCookie, ShouldEqual, "cookie")
@@ -216,17 +221,7 @@ func TestDashboardFetchWithRemoteChrome(t *testing.T) {
 				chromeInstance,
 				ts.URL,
 				"v11.4.0",
-				&Model{Dashboard: struct {
-					ID          int          `json:"id"`
-					UID         string       `json:"uid"`
-					Title       string       `json:"title"`
-					Description string       `json:"description"`
-					RowOrPanels []RowOrPanel `json:"panels"`
-					Panels      []Panel
-					Variables   url.Values
-				}{
-					UID: "randomUID",
-				}},
+				testSnapshot("randomUID"),
 				http.Header{
 					backend.CookiesHeaderName: []string{"cookie"},
 				},
@@ -241,8 +236,8 @@ func TestDashboardFetchWithRemoteChrome(t *testing.T) {
 			Convey("It should receive no errors", func() {
 				So(err, ShouldBeNil)
 			})
-			Convey("It should use the v5 dashboards endpoint", func() {
-				So(requestURI, ShouldContain, "/d/randomUID/_?")
+			Convey("It should use the v5 dashboards endpoint with the pinned absolute time window", func() {
+				So(strings.Join(requestURI, ","), ShouldContainSubstring, "/d/randomUID/_?from=1734194465000&to=1734198065000")
 			})
 			Convey("It should use cookie", func() {
 				So(requestCookie, ShouldEqual, "cookie")
@@ -263,17 +258,7 @@ func TestDashboardCreatePanels(t *testing.T) {
 			nil,
 			"http://localhost:3000",
 			"v11.4.0",
-			&Model{Dashboard: struct {
-				ID          int          `json:"id"`
-				UID         string       `json:"uid"`
-				Title       string       `json:"title"`
-				Description string       `json:"description"`
-				RowOrPanels []RowOrPanel `json:"panels"`
-				Panels      []Panel
-				Variables   url.Values
-			}{
-				UID: "randomUID",
-			}},
+			testSnapshot("randomUID"),
 			nil,
 		)
 
